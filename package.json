@@ -1,0 +1,17 @@
+{
+  "name": "cwf-push-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Free background FCM push for Cook with Friends — friend requests, accepts, chat messages, friend-feed posts, club posts, added-to-club. GitHub Actions cron + Firebase Admin SDK, no Cloud Functions, no Blaze plan (Spark-friendly, incremental cursor scan).",
+  "main": "scan.js",
+  "scripts": {
+    "scan": "node scan.js",
+    "test": "node selftest.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

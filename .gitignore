@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+# NEVER commit a service-account key — it goes in a GitHub Actions secret.
+service-account*.json
+*-firebase-adminsdk-*.json
+.env

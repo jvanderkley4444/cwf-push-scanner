@@ -1,0 +1,21 @@
+name: test
+
+# Offline unit checks for scan.js pure logic — runs on every push/PR, no secrets.
+on:
+  push:
+    paths: ['**.js']
+  pull_request:
+    paths: ['**.js']
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci --prefer-offline --no-audit --no-fund || npm install --no-audit --no-fund
+      - run: npm test

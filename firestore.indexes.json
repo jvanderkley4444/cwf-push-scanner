@@ -1,0 +1,22 @@
+{
+  "//": "Collection-GROUP single-field indexes the scanner needs (feed + posts live under many parents, so the app's per-parent indexes don't cover a cross-collection query). The single-collection cursors (friendships.ts, friendships.acceptedAt, clubs.ts, chats.lastMsg.ts) are auto-indexed and need nothing here. Deploy to the cookwithfriends-3b40e project:  firebase deploy --only firestore:indexes  — OR just run the scanner once and click the console link each first-time query prints.",
+  "indexes": [],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "feed",
+      "fieldPath": "timestamp",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    },
+    {
+      "collectionGroup": "posts",
+      "fieldPath": "ts",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    }
+  ]
+}

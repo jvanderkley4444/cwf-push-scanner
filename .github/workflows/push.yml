@@ -1,0 +1,44 @@
+name: CWF push (friends · messages · feed · clubs)
+
+# Free, app-closed push for Cook with Friends social events, on the SPARK plan
+# (no Cloud Functions, no Blaze). GitHub cron is best-effort (can run a few min
+# late; scheduled workflows auto-pause after 60 days of repo inactivity — any
+# commit re-arms them). Times are UTC.
+#
+# COST — GitHub (private repo): 2,000 free Action-minutes/month. Every 15 min =
+# 96 runs/day ≈ 2,880/month; with the npm cache each run is well under a minute,
+# so this fits the free tier. If you want extra headroom, drop to '*/30' (720
+# runs/month) — messages then arrive up to ~30 min after they're sent. Make the
+# repo PUBLIC and Actions minutes are unlimited (then '*/15' or tighter is free).
+#
+# COST — Firebase (Spark): the scanner is INCREMENTAL — each run only queries
+# docs changed since the last run (cursor in pushState/_meta), so Firestore reads
+# scale with activity, not total data. A quiet app costs a handful of reads per
+# run; well inside Spark's 50k reads / 20k writes per day.
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes
+  workflow_dispatch: {}       # "Run workflow" button for manual/test runs
+
+concurrency:
+  group: cwf-push
+  cancel-in-progress: false   # never let two runs overlap and double-process
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'         # cache ~/.npm so installs are fast → fewer billed minutes
+      - name: Install deps
+        run: npm ci --prefer-offline --no-audit --no-fund || npm install --no-audit --no-fund
+      - name: Send social pushes
+        env:
+          # Paste the cookwithfriends-3b40e service-account JSON (one line) into this
+          # repo secret: Settings → Secrets and variables → Actions → New secret.
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: node scan.js

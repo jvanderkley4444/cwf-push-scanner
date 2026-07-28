@@ -1,0 +1,30 @@
+name: test-push (manual end-to-end banner)
+
+# "Run workflow" → sends ONE real test banner to the given user's devices via
+# FCM (defaults to the owner). Verifies service account + APNs key + tokens
+# without waiting for a real friend/message event. Never runs on a schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Account email to push to'
+        required: false
+        default: 'you@example.com'
+
+jobs:
+  test-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install deps
+        run: npm ci --prefer-offline --no-audit --no-fund || npm install --no-audit --no-fund
+      - name: Send test push
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          TEST_EMAIL: ${{ inputs.email }}
+        run: node test-push.js

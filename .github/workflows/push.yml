@@ -42,3 +42,11 @@ jobs:
           # repo secret: Settings → Secrets and variables → Actions → New secret.
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: node scan.js
+      # Jeff feedback (2026-08-02, PDF p13): the Render free dyno spins down and
+      # its 5s health probe then times out ("Server failure detected on
+      # cwf-ai-orchestrator"). This cron already fires every 15 min — piggyback a
+      # keep-warm ping so the AI kitchen never goes fully cold. Best-effort: a
+      # slow/failed ping never fails the push job.
+      - name: Keep AI orchestrator warm
+        if: always()
+        run: curl -m 25 -fsS https://cwf-ai-orchestrator.onrender.com/healthz -o /dev/null || true

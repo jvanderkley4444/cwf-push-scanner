@@ -229,6 +229,11 @@ async function main() {
       const lm = c.lastMsg || {};
       if (!lm.ts || !lm.authorUid || !Array.isArray(c.members)) continue;
       const reads = c.reads || {};
+      // 2026-08-15: the app now alerts in-app for closed threads while it's
+      // OPEN, and stamps chats/{id}.seen{uid:ts} for what it already surfaced.
+      // Skipping those stops the same message arriving twice (in-app banner
+      // now + push 15 min later). Absent on older clients → unchanged behavior.
+      const seen = c.seen || {};
       const sender = lm.userName || 'Someone';
       const group = c.kind === 'group';
       const title = group ? `💬 ${c.name || 'Group chat'}` : `💬 ${sender}`;
@@ -237,6 +242,7 @@ async function main() {
       for (const to of c.members) {
         if (!to || to === lm.authorUid) continue;               // don't ping the sender
         if ((reads[to] || 0) >= lm.ts) continue;                // already read on some device
+        if ((seen[to] || 0) >= lm.ts) continue;                 // already alerted in-app
         if (await deliver(db, messaging, getUser, `msg_${d.id}_${to}_${lm.ts}`, to, {
           cat: 'messages', kind: 'chat_message', url: '/?tab=messages', title, body
         })) pushed++;

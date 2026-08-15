@@ -1,11 +1,13 @@
 {
-  "//": "Collection-GROUP single-field indexes the scanner needs (feed + posts live under many parents, so the app's per-parent indexes don't cover a cross-collection query). The single-collection cursors (friendships.ts, friendships.acceptedAt, clubs.ts, chats.lastMsg.ts) are auto-indexed and need nothing here. Deploy to the cookwithfriends-3b40e project:  firebase deploy --only firestore:indexes  — OR just run the scanner once and click the console link each first-time query prints.",
+  "//": "Field-override indexes the scanner needs. feed.timestamp and posts.ts get a COLLECTION_GROUP index (for the scanner's cross-parent collectionGroup queries) AND keep their COLLECTION-scope asc/desc indexes (which the in-app per-parent feed/club listeners orderBy). Creating an override turns off automatic indexing for that field, so the COLLECTION entries below MUST stay or the app's feed/club queries break. Deploy:  firebase deploy --only firestore:indexes --project cookwithfriends-3b40e",
   "indexes": [],
   "fieldOverrides": [
     {
       "collectionGroup": "feed",
       "fieldPath": "timestamp",
       "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
         { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" },
         { "order": "DESCENDING", "queryScope": "COLLECTION_GROUP" }
       ]
@@ -14,6 +16,8 @@
       "collectionGroup": "posts",
       "fieldPath": "ts",
       "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION" },
+        { "order": "DESCENDING", "queryScope": "COLLECTION" },
         { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" },
         { "order": "DESCENDING", "queryScope": "COLLECTION_GROUP" }
       ]

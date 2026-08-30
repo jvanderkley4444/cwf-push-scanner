@@ -1,15 +1,14 @@
 name: test-push (manual end-to-end banner)
 
 # "Run workflow" → sends ONE real test banner to the given user's devices via
-# FCM (defaults to the owner). Verifies service account + APNs key + tokens
+# FCM. Verifies service account + APNs key + tokens
 # without waiting for a real friend/message event. Never runs on a schedule.
 on:
   workflow_dispatch:
     inputs:
       email:
         description: 'Account email to push to'
-        required: false
-        default: 'you@example.com'
+        required: true
 
 jobs:
   test-push:

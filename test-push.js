@@ -22,7 +22,15 @@ function initAdmin() {
 
 async function main() {
   initAdmin();
-  const email = (process.env.TEST_EMAIL || 'you@example.com').trim();
+  // No default address: this repo is public, and a hard-coded personal email
+  // would be permanently published and scraped. Pass one in:
+  //   Actions  → "Run workflow" → Account email
+  //   locally  → TEST_EMAIL=you@example.com node test-push.js
+  const email = String(process.env.TEST_EMAIL || '').trim();
+  if (!email) {
+    console.error('Set TEST_EMAIL to the account you want to push to (workflow input "email").');
+    process.exit(1);
+  }
   const user = await admin.auth().getUserByEmail(email);
   const doc = await admin.firestore().collection('users').doc(user.uid).get();
   const fcmTokens = (doc.data() || {}).fcmTokens || {};

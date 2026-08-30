@@ -50,6 +50,47 @@ function fb() { return admin || (admin = require('firebase-admin')); }
 // overlap so nothing is sent twice.
 const OVERLAP_MS = 2 * 60 * 1000;
 
+const HOUR_MS = 60 * 60 * 1000;
+
+// A stalled cursor used to be unbounded: ONE permanently-failing step (a missing
+// collection-group index, say) held the single global cursor forever, so every
+// later run re-queried an ever-widening window — the "incremental" scan silently
+// degraded into a full-table scan and burned Spark's 50k reads/day. Two guards:
+//
+//   MAX_LOOKBACK_MS  hard ceiling on how far back any query may reach.
+//   MAX_EVENT_AGE_MS events older than this are marked handled but NOT pushed,
+//                    so the first run after an outage (push was down 25-30 Aug
+//                    2026 when the GitHub Actions minute budget ran out) does not
+//                    fire a multi-day backlog of banners at everyone at once.
+const MAX_LOOKBACK_MS  = (Number(process.env.MAX_LOOKBACK_HOURS)  || 48) * HOUR_MS;
+const MAX_EVENT_AGE_MS = (Number(process.env.MAX_EVENT_AGE_HOURS) || 12) * HOUR_MS;
+
+// The six independent event types, each with its OWN cursor. A failure in one
+// no longer holds the other five back.
+const STEPS = ['friend_requests', 'friend_accepts', 'chat_messages', 'friend_feed', 'club_posts', 'club_added'];
+
+// Earliest timestamp a step may query for: its own cursor minus the overlap,
+// but never further back than MAX_LOOKBACK_MS.
+function windowStart(cursorMs, runAt) { return Math.max(cursorMs - OVERLAP_MS, runAt - MAX_LOOKBACK_MS); }
+
+// True when an event is too old to be worth a banner. No timestamp → not stale
+// (unchanged behaviour for any caller that doesn't supply one).
+function isStale(evAt, now) { return !!(evAt && (now - evAt) > MAX_EVENT_AGE_MS); }
+
+// Run an async fn over items with bounded concurrency. The member fan-outs are
+// O(posts x members) sequential round-trips; doing them 8-at-a-time keeps a busy
+// run inside the 60-second boundary that decides whether GitHub bills the job as
+// one minute or two.
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async function () {
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i], i);
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 function initAdmin() {
   const a = fb();
   if (a.apps.length) return;
@@ -133,6 +174,12 @@ async function deliver(db, messaging, getUser, key, uid, ev) {
   if (!uid) return false;
   const psRef = db.collection('pushState').doc(key);
   if ((await psRef.get()).exists) return false;                 // already handled
+  // Too old to be worth a banner — record it so it can never fire later, but
+  // stay silent. (ev.at absent → treated as fresh, same as before.)
+  if (isStale(ev.at, Date.now())) {
+    await psRef.set({ at: Date.now(), kind: ev.kind, uid, status: 'stale' }).catch(() => {});
+    return false;
+  }
   const user = await getUser(uid);
   const status = await sendToUser(db, messaging, user, uid, ev);
   if (status === 'sent' || status === 'muted') {
@@ -174,21 +221,35 @@ async function main() {
     return;
   }
 
-  const sinceMs = (meta.lastRunAt || runAt) - OVERLAP_MS;
-  const sinceTs = fb().firestore.Timestamp.fromMillis(sinceMs);
+  // One-time migration off the single global cursor: any step without its own
+  // cursor inherits the legacy lastRunAt, so the upgrade neither replays nor
+  // skips anything.
+  const cursors = Object.assign({}, meta.cursors || {});
+  for (const sName of STEPS) if (!cursors[sName]) cursors[sName] = meta.lastRunAt || runAt;
+
+  const advanced = {};
   let pushed = 0, hadError = false;
 
-  // Run one event type in isolation: if its query fails (e.g. a collection-group
-  // index isn't built yet, or a transient error), log it and mark hadError so we
-  // DON'T advance the cursor — the whole window retries next run and dedupe stops
-  // double-sends. One failing event can never abort the others or lose events.
+  // Run one event type in isolation against ITS OWN cursor. If its query fails
+  // (a collection-group index isn't built yet, a transient error), log it and
+  // leave that step's cursor where it was — its window retries next run and
+  // dedupe stops double-sends, while the other five still advance normally.
+  // One failing event can never abort the others, lose events, or (since the
+  // MAX_LOOKBACK clamp) grow into an unbounded scan.
   async function step(label, fn) {
-    try { await fn(); }
-    catch (e) { hadError = true; console.error(`[${label}] failed — cursor held, will retry: ${(e && e.message) || e}`); }
+    // Clamped so even a week-long outage can only ever ask for MAX_LOOKBACK_MS.
+    const sinceMs = windowStart(cursors[label], runAt);
+    try {
+      await fn(sinceMs, fb().firestore.Timestamp.fromMillis(sinceMs));
+      advanced[label] = runAt;                                   // only THIS step moves
+    } catch (e) {
+      hadError = true;
+      console.error(`[${label}] failed — its cursor held at ${new Date(sinceMs).toISOString()}, will retry: ${(e && e.message) || e}`);
+    }
   }
 
   // 1) New friend requests → notify the recipient (the member who didn't ask).
-  await step('friend_requests', async () => {
+  await step('friend_requests', async (sinceMs, sinceTs) => {
     const snap = await db.collection('friendships').where('ts', '>', sinceTs).get();
     for (const d of snap.docs) {
       const f = d.data() || {};
@@ -197,7 +258,7 @@ async function main() {
       const from = nameFor(f, f.requestedBy);
       const tsMs = tsToMillis(f.ts, runAt);
       if (await deliver(db, messaging, getUser, `fr_${d.id}_${tsMs}`, to, {
-        cat: 'friends', kind: 'friend_request', url: '/?tab=friends',
+        cat: 'friends', kind: 'friend_request', url: '/?tab=friends', at: tsMs,
         title: '👋 New friend request', body: `${from} wants to connect on Cook with Friends`
       })) pushed++;
     }
@@ -205,7 +266,7 @@ async function main() {
 
   // 2) Accepted requests → notify the original requester. (Needs the acceptedAt
   //    client field; until that ships this query simply returns nothing.)
-  await step('friend_accepts', async () => {
+  await step('friend_accepts', async (sinceMs, sinceTs) => {
     const snap = await db.collection('friendships').where('acceptedAt', '>', sinceTs).get();
     for (const d of snap.docs) {
       const f = d.data() || {};
@@ -214,7 +275,7 @@ async function main() {
       const who = nameFor(f, accepter);
       const aMs = tsToMillis(f.acceptedAt, runAt);
       if (await deliver(db, messaging, getUser, `fa_${d.id}_${aMs}`, f.requestedBy, {
-        cat: 'friends', kind: 'friend_accept', url: '/?tab=friends',
+        cat: 'friends', kind: 'friend_accept', url: '/?tab=friends', at: aMs,
         title: '🎉 Friend request accepted', body: `${who} accepted your friend request`
       })) pushed++;
     }
@@ -222,7 +283,7 @@ async function main() {
 
   // 3) New chat messages (DM + group). Detected purely from the chat doc's
   //    lastMsg preview + reads{} watermark — zero message-subcollection reads.
-  await step('chat_messages', async () => {
+  await step('chat_messages', async (sinceMs, sinceTs) => {
     const snap = await db.collection('chats').where('lastMsg.ts', '>', sinceMs).get();
     for (const d of snap.docs) {
       const c = d.data() || {};
@@ -239,19 +300,19 @@ async function main() {
       const title = group ? `💬 ${c.name || 'Group chat'}` : `💬 ${sender}`;
       const preview = lm.text || 'New message';
       const body = group ? `${sender}: ${preview}` : preview;
-      for (const to of c.members) {
-        if (!to || to === lm.authorUid) continue;               // don't ping the sender
-        if ((reads[to] || 0) >= lm.ts) continue;                // already read on some device
-        if ((seen[to] || 0) >= lm.ts) continue;                 // already alerted in-app
-        if (await deliver(db, messaging, getUser, `msg_${d.id}_${to}_${lm.ts}`, to, {
-          cat: 'messages', kind: 'chat_message', url: '/?tab=messages', title, body
-        })) pushed++;
-      }
+      const targets = c.members.filter(to =>
+        to && to !== lm.authorUid &&                            // don't ping the sender
+        !((reads[to] || 0) >= lm.ts) &&                         // already read on some device
+        !((seen[to] || 0) >= lm.ts));                           // already alerted in-app
+      const sent = await mapLimit(targets, 8, to => deliver(db, messaging, getUser, `msg_${d.id}_${to}_${lm.ts}`, to, {
+        cat: 'messages', kind: 'chat_message', url: '/?tab=messages', title, body, at: lm.ts
+      }));
+      pushed += sent.filter(Boolean).length;
     }
   });
 
   // 4) New friend-feed posts (a friend shared a cook, or sent you a recipe).
-  await step('friend_feed', async () => {
+  await step('friend_feed', async (sinceMs, sinceTs) => {
     const snap = await db.collectionGroup('feed').where('timestamp', '>', sinceMs).get();
     for (const d of snap.docs) {
       const p = d.data() || {};
@@ -261,7 +322,7 @@ async function main() {
       const who = p.userName || 'A friend';
       const recipe = p.kind === 'recipe';
       if (await deliver(db, messaging, getUser, `feed_${d.id}`, to, {
-        cat: 'feed', kind: recipe ? 'feed_recipe' : 'feed_cook', url: '/?tab=feed',
+        cat: 'feed', kind: recipe ? 'feed_recipe' : 'feed_cook', url: '/?tab=feed', at: tsToMillis(p.timestamp, runAt),
         title: recipe ? '🍳 A recipe just for you' : '🍽️ New cook from a friend',
         body: recipe ? `${who} sent you “${p.recipeTitle || 'a recipe'}”` : `${who} shared what they cooked`
       })) pushed++;
@@ -269,7 +330,7 @@ async function main() {
   });
 
   // 5) New club posts → notify every club member except the author.
-  await step('club_posts', async () => {
+  await step('club_posts', async (sinceMs, sinceTs) => {
     const snap = await db.collectionGroup('posts').where('ts', '>', sinceMs).get();
     const clubCache = new Map();
     for (const d of snap.docs) {
@@ -289,12 +350,12 @@ async function main() {
       const body = p.kind === 'recipe' ? `${who} shared a recipe in ${clubName}`
         : p.kind === 'cook' ? `${who} posted a cook in ${clubName}`
         : `${who} posted in ${clubName}`;
-      for (const to of members) {
-        if (!to || to === p.authorUid) continue;
-        if (await deliver(db, messaging, getUser, `club_${d.id}_${to}`, to, {
-          cat: 'feed', kind: 'club_post', url: '/?tab=clubs', title: `👩‍🍳 ${clubName}`, body
-        })) pushed++;
-      }
+      const postAt = tsToMillis(p.ts, runAt);
+      const sent = await mapLimit(members.filter(to => to && to !== p.authorUid), 8,
+        to => deliver(db, messaging, getUser, `club_${d.id}_${to}`, to, {
+          cat: 'feed', kind: 'club_post', url: '/?tab=clubs', title: `👩‍🍳 ${clubName}`, body, at: postAt
+        }));
+      pushed += sent.filter(Boolean).length;
     }
   });
 
@@ -303,7 +364,7 @@ async function main() {
   //    signature we stored — unchanged → skip with a single read, no per-member
   //    lookups. When it changed, a member with no clubmember marker (and who
   //    isn't the owner or the one who made the change) is newly added → notify.
-  await step('club_added', async () => {
+  await step('club_added', async (sinceMs, sinceTs) => {
     const snap = await db.collection('clubs').where('ts', '>', sinceTs).get();
     for (const d of snap.docs) {
       const club = d.data() || {};
@@ -313,28 +374,41 @@ async function main() {
       const prev = await rosterRef.get();
       if (prev.exists && (prev.data() || {}).sig === sig) continue;   // roster unchanged → nothing to do
       const clubName = club.name || 'a cooking club';
-      for (const to of members) {
-        if (!to || to === club.owner || to === club.lastBy) continue;
-        if (await deliver(db, messaging, getUser, `clubmember_${d.id}_${to}`, to, {
-          cat: 'friends', kind: 'club_added', url: '/?tab=clubs',
+      const clubAt = tsToMillis(club.ts, runAt);
+      const sent = await mapLimit(members.filter(to => to && to !== club.owner && to !== club.lastBy), 8,
+        to => deliver(db, messaging, getUser, `clubmember_${d.id}_${to}`, to, {
+          cat: 'friends', kind: 'club_added', url: '/?tab=clubs', at: clubAt,
           title: '👥 Added to a cooking club', body: `You were added to ${clubName}`
-        })) pushed++;
-      }
+        }));
+      pushed += sent.filter(Boolean).length;
       await rosterRef.set({ sig, at: runAt }).catch(() => {});
     }
   });
 
   // Advance the cursor only if EVERY event succeeded; otherwise keep the old one
   // so the window is fully retried next run (dedupe prevents double-sends).
+  // lastRunAt is now a pure HEARTBEAT (always advances) so "when did push last
+  // run?" is answerable even while a step is broken; correctness lives in the
+  // per-step cursors, and only steps that actually succeeded move forward.
+  const nextCursors = Object.assign({}, cursors, advanced);
+  await curRef.set({
+    seeded: true,
+    lastRunAt: runAt,
+    cursors: nextCursors,
+    lastStatus: hadError ? 'partial' : 'ok',
+    lastOkAt: hadError ? (meta.lastOkAt || null) : runAt,
+    lastPushed: pushed
+  }, { merge: true });
+
   if (!hadError) {
-    await curRef.set({ seeded: true, lastRunAt: runAt }, { merge: true });
-    console.log(`Scan complete — pushed ${pushed} new notification(s). Cursor → ${new Date(runAt).toISOString()}`);
+    console.log(`Scan complete — pushed ${pushed} new notification(s). Cursors → ${new Date(runAt).toISOString()}`);
   } else {
-    console.log(`Scan finished WITH ERRORS — pushed ${pushed}; cursor NOT advanced (retries next run). If a "create index" link appears above, open it once to build the index.`);
+    const held = STEPS.filter(x => !(x in advanced));
+    console.log(`Scan finished WITH ERRORS — pushed ${pushed}; cursor held ONLY for: ${held.join(', ')} (the rest advanced). If a "create index" link appears above, open it once to build the index.`);
   }
 }
 
-module.exports = { nameFor, otherInPair, tsToMillis, categoryMuted, sendToUser, deliver, main };
+module.exports = { nameFor, otherInPair, tsToMillis, categoryMuted, windowStart, isStale, mapLimit, sendToUser, deliver, main, MAX_LOOKBACK_MS, MAX_EVENT_AGE_MS, OVERLAP_MS };
 
 if (require.main === module) {
   main().then(() => process.exit(0)).catch(err => { console.error('SCAN FAILED:', err); process.exit(1); });

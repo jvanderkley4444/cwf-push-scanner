@@ -27,8 +27,8 @@ The scanner is **incremental**, not a full scan. It keeps a cursor in
 newer than the last run (minus a 2-minute overlap for clock-skew / late crons):
 
 ```
-GitHub Actions cron (every 15m)
-  read pushState/_meta.lastRunAt                       (1 read)
+GitHub Actions cron (tiered — see "Staying free" below)
+  read pushState/_meta.cursors.<step>                  (1 read, per-step cursors)
   friendships where ts        > since                  (only NEW requests)
   friendships where acceptedAt> since                  (only NEW accepts)
   chats       where lastMsg.ts> since                  (only chats w/ a new msg — NO message reads)
@@ -38,6 +38,13 @@ GitHub Actions cron (every 15m)
   → per new event: 1 pushState read (dedupe) + FCM send + 1 pushState write
   write pushState/_meta.lastRunAt                       (1 write)
 ```
+
+Each of the six event types keeps its **own** cursor (`pushState/_meta.cursors`).
+Before 2026-08-30 there was a single global cursor held back whenever *any* step
+failed — so one permanently-broken step (a missing collection-group index, say)
+meant the window grew wider on every run and the "incremental" scan quietly
+degraded into a full-table scan. Per-step cursors plus a hard
+`MAX_LOOKBACK_HOURS` clamp (default 48 h) make that impossible.
 
 So **reads scale with activity since the last run, not with total data.** Messages
 are detected from the chat doc's own `lastMsg` preview + `reads{}` watermark, so the
@@ -52,6 +59,84 @@ genuinely new event re-notifies. No token yet → left unrecorded so it retries.
 **First run is a no-op send:** it plants the cursor and records current club
 memberships, then sends **nothing** — deploying the scanner never fires a
 notification for the pre-existing backlog of friends/messages/clubs.
+
+## Staying free — and the 25 Aug 2026 outage
+
+Push was **dead from ~25 Aug to 30 Aug 2026**. Every scheduled run failed in 3-5
+seconds without ever being given a runner:
+
+> The job was not started because recent account payments have failed or your
+> spending limit needs to be increased.
+
+The account had spent its **2,000 free Action-minutes/month**. The old cost note
+in `push.yml` did the maths wrong — **GitHub bills every job rounded UP to a whole
+minute**, so a 40-second run still costs a full minute. At `*/15` that is 96
+runs/day = **~2,880 min/month for this workflow alone**, i.e. 144 % of the entire
+free allowance before any other repo runs anything.
+
+Measured August usage across the whole account (successful runs only):
+
+| Repo | Workflow | Runs | Billed min | Median |
+|---|---|---:|---:|---:|
+| clawback-ai-orchestrator | keep-warm | 516 | ~516 | **8 s** |
+| tabby-ai-orchestrator | keep-warm | 505 | ~506 | **8 s** |
+| clawback-push-scanner | push | 437 | ~437 | 22 s |
+| **cwf-push-scanner** | **push** | **407** | **~417** | **40 s** |
+| tabby-trade-scanner | scan + backfill | 126 | ~133 | 23 s |
+| | | | **~2,010 / 2,000** | |
+
+The two standalone `keep-warm` workflows were **51 % of the entire allowance**,
+spent on one 8-second `curl` every 13 minutes. Those pings now piggyback on
+scanner jobs that were already running, so they cost nothing.
+
+**What changed here**
+
+* **Tiered cron** — dense at dinner, sparse overnight: `*/15` 18:00-22:59 ET,
+  `*/30` 10:00-17:59 ET, every 2 h 23:00-09:59 ET. 42 runs/day =
+  ~**1,300 min/month**, down 56 % from ~2,976.
+* **`node_modules` cached directly** (not just `~/.npm`) so a cache hit skips
+  `npm` entirely — runtime is what tips a job over the 60-second boundary into a
+  *second* billed minute. One August run took 348 s = 6 billed minutes.
+* **`runs-on: ubuntu-24.04`**, pinned — the 6 Aug outage ("job was not acquired
+  by Runner of type hosted" + "Internal server error") hit the `ubuntu-latest`
+  migration pool.
+* **`timeout-minutes: 5`** instead of 8 — a healthy run is ~15 s.
+* **Outage-backlog guard** — `MAX_EVENT_AGE_HOURS` (default 12). The first run
+  after an outage marks older events handled but sends **no** banner, so nobody
+  receives five days of notifications in one burst.
+
+**Still not enough on its own.** The 2,000 minutes are shared across the WHOLE
+account. Even after this repo drops to ~1,300, the fleet wants ~3,520:
+
+| Repo | Cadence | Runs/day | Min/month |
+|---|---|---:|---:|
+| cwf-push-scanner | tiered (this file) | 42 | ~1,300 |
+| clawback-push-scanner | `*/30` flat | 48 | ~1,490 |
+| tabby-trade-scanner | `*/15` market hours | ~32 (weekdays) | ~730 |
+| | | | **~3,520 / 2,000** |
+
+Deleting the keep-warm crons bought back ~1,022 min/month, which is what makes
+*this* repo viable — but the other two scanners still need the same tiering
+treatment (or the flip below) before the account stops hitting the wall around
+day 17 of each month.
+
+**The permanent fix: make this repo public.** GitHub-hosted standard runners are
+**free and unlimited for public repos**, so the minute budget stops existing and
+the cron can go back to `*/15` (or tighter). Nothing here is secret — the
+service-account JSON lives in an Actions secret, which stays private on a public
+repo, and the git history has been checked for committed keys:
+
+```bash
+gh repo edit jvanderkley4444/cwf-push-scanner --visibility public --accept-visibility-change-consequences
+```
+
+Then swap the three tiered cron lines in `push.yml` for the single `*/15` line.
+
+**Is push alive?** `pushState/_meta` now carries a heartbeat: `lastRunAt` always
+advances, `lastStatus` is `ok`/`partial`, `lastOkAt` is the last fully clean run,
+and `cursors` shows exactly which step (if any) is stuck. If `lastRunAt` is more
+than an hour or two old the cron is not running — check Actions and billing
+first, not the code.
 
 ## Latency caveat (messages)
 
@@ -96,7 +181,8 @@ single-collection cursors (`friendships.ts`, `friendships.acceptedAt`, `clubs.ts
 5. Repo → Settings → Secrets and variables → Actions → **New secret**
    `FIREBASE_SERVICE_ACCOUNT` = the entire service-account JSON (one line).
 6. Actions tab → enable → **Run workflow** once (this is the seed run) → then it
-   runs every 15 min.
+   runs on the tiered cron in `push.yml` (see **Staying free** above; make the
+   repo public if you want `*/15` around the clock).
 
 ### D. Client patches (in the app repo — `apps/CookWithFriends`)
 Push only works if the app **writes device tokens** and the scanner can read

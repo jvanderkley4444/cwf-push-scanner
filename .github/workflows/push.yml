@@ -1,24 +1,78 @@
 name: CWF push (friends · messages · feed · clubs)
 
 # Free, app-closed push for Cook with Friends social events, on the SPARK plan
-# (no Cloud Functions, no Blaze). GitHub cron is best-effort (can run a few min
-# late; scheduled workflows auto-pause after 60 days of repo inactivity — any
-# commit re-arms them). Times are UTC.
+# (no Cloud Functions, no Blaze). Times below are UTC.
 #
-# COST — GitHub (private repo): 2,000 free Action-minutes/month. Every 15 min =
-# 96 runs/day ≈ 2,880/month; with the npm cache each run is well under a minute,
-# so this fits the free tier. If you want extra headroom, drop to '*/30' (720
-# runs/month) — messages then arrive up to ~30 min after they're sent. Make the
-# repo PUBLIC and Actions minutes are unlimited (then '*/15' or tighter is free).
+# ── WHY THIS WAS REWRITTEN (2026-08-30) ──────────────────────────────────────
+# Push had been DEAD since ~25 Aug. Every scheduled run failed in 3-5 s without
+# ever being assigned a runner, with the annotation:
 #
-# COST — Firebase (Spark): the scanner is INCREMENTAL — each run only queries
-# docs changed since the last run (cursor in pushState/_meta), so Firestore reads
-# scale with activity, not total data. A quiet app costs a handful of reads per
-# run; well inside Spark's 50k reads / 20k writes per day.
+#   "The job was not started because recent account payments have failed or your
+#    spending limit needs to be increased."
+#
+# i.e. the ACCOUNT ran out of its 2,000 free Action-minutes/month. The old
+# header comment did the cost maths wrong: GitHub bills every job rounded UP to
+# a whole minute, so a 40-second run still costs 1 minute. At '*/15' that is
+# 96 runs/day ≈ 2,880 minutes/month for THIS workflow alone — 144 % of the
+# entire free allowance before any other repo runs a thing.
+#
+# Measured August usage across the account (successful runs only):
+#     clawback-ai-orchestrator  keep-warm   516 runs → ~516 min   (8 s each!)
+#     tabby-ai-orchestrator     keep-warm   505 runs → ~506 min   (8 s each!)
+#     clawback-push-scanner     push        437 runs → ~437 min
+#     cwf-push-scanner          push        407 runs → ~417 min
+#     tabby-trade-scanner       scan+backfill 126 runs → ~133 min
+#                                                     ─────────
+#                                            TOTAL   ~2,010 min / 2,000 free
+#
+# ── THE PERMANENT FIX ────────────────────────────────────────────────────────
+# Make this repository PUBLIC. GitHub-hosted standard runners are FREE AND
+# UNLIMITED for public repos, so the minute budget stops existing and the cron
+# can go back to (or below) '*/15'. Nothing here is secret: the service-account
+# JSON lives in an Actions secret, which stays private on a public repo, and
+# git history has been checked for committed keys. One command:
+#
+#     gh repo edit jvanderkley4444/cwf-push-scanner --visibility public
+#
+# Then delete the three tiered cron lines below and use the single '*/15' line.
+#
+# ── TIERED CRON (private-repo safe) ──────────────────────────────────────────
+# Because cost == NUMBER OF RUNS, not their length, the only lever on a private
+# repo is running less often when nobody is looking. Times below are Eastern
+# (UTC-4 in summer); the schedule is dense at dinner and sparse overnight:
+#
+#     18:00-22:59 ET   every 15 min    20 runs/day   ← when people cook & chat
+#     10:00-17:59 ET   every 30 min    16 runs/day
+#     23:00-09:59 ET   every 2 hours    6 runs/day
+#                                     ───────────
+#                                      42 runs/day ≈ 1,300 min/month
+#
+# ⚠️  THIS ALONE IS NOT ENOUGH — the 2,000 minutes are shared ACROSS THE WHOLE
+#     ACCOUNT, and with the other two scanners left at their current cadence the
+#     fleet still wants ~3,500 min/month:
+#
+#         cwf-push-scanner    42/day  ~1,300   (this file, after the fix)
+#         clawback-push-scanner 48/day ~1,490  (*/30 flat, untiered)
+#         tabby-trade-scanner ~32/wkdy  ~730   (*/15 on market hours)
+#                                     ────────
+#                                       ~3,520 / 2,000  → runs out ~day 17
+#
+#     Removing the two keep-warm workflows bought back ~1,022 min/month, which is
+#     what makes THIS repo viable, but the other two scanners still need tiering
+#     (or the public flip above) before the account stops hitting the wall.
+#
+# ── COST — Firebase (Spark) ──────────────────────────────────────────────────
+# The scanner is INCREMENTAL — each run only queries docs changed since that
+# step's own cursor, so Firestore reads scale with activity, not total data.
+# Well inside Spark's 50k reads / 20k writes per day.
 on:
   schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes
-  workflow_dispatch: {}       # "Run workflow" button for manual/test runs
+    - cron: '*/15 22-23,0-2 * * *'   # 18:00-22:59 ET — dinner/evening peak
+    - cron: '0,30 14-21 * * *'       # 10:00-17:59 ET — daytime
+    - cron: '0 3-13/2 * * *'         # 23:00-09:59 ET — overnight, every 2 h
+    # PUBLIC-REPO VERSION — delete the three lines above, uncomment this one:
+    # - cron: '*/15 * * * *'
+  workflow_dispatch: {}              # "Run workflow" button for manual/test runs
 
 concurrency:
   group: cwf-push
@@ -26,27 +80,61 @@ concurrency:
 
 jobs:
   push:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Pinned, not 'ubuntu-latest': the 6 Aug outage ("The job was not acquired by
+    # Runner of type hosted even after multiple attempts" + "Internal server
+    # error") hit the ubuntu-latest migration pool. A pinned image is a stabler
+    # queue and identical in cost.
+    runs-on: ubuntu-24.04
+    # 5 not 8: a healthy run is ~15 s. Anything past 5 min is wedged, and every
+    # extra minute it hangs is a billed minute (one August run took 348 s = 6
+    # billed minutes for a single scan).
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+
+      # Node 20 is already in ubuntu-24.04's tool cache, so this resolves locally
+      # in ~1 s with no download. Kept (rather than relying on whatever the image
+      # ships) so the cached node_modules below can never be paired with a
+      # different major version after an image bump. No 'cache: npm' — the
+      # node_modules cache below supersedes it and its restore is pure overhead.
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'         # cache ~/.npm so installs are fast → fewer billed minutes
+
+      # Cache node_modules ITSELF, not just ~/.npm. On a hit this is a plain
+      # tarball extract (~2 s) and npm never runs at all — that is the single
+      # biggest chunk of the old ~40 s runtime, and runtime is what pushes a job
+      # over the 60-second billing boundary into a second billed minute.
+      - name: Restore node_modules
+        id: modcache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-node20-${{ hashFiles('package-lock.json') }}
+
       - name: Install deps
+        if: steps.modcache.outputs.cache-hit != 'true'
         run: npm ci --prefer-offline --no-audit --no-fund || npm install --no-audit --no-fund
+
       - name: Send social pushes
         env:
           # Paste the cookwithfriends-3b40e service-account JSON (one line) into this
           # repo secret: Settings → Secrets and variables → Actions → New secret.
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-        run: node scan.js
-      # Jeff feedback (2026-08-02, PDF p13): the Render free dyno spins down and
-      # its 5s health probe then times out ("Server failure detected on
-      # cwf-ai-orchestrator"). This cron already fires every 15 min — piggyback a
-      # keep-warm ping so the AI kitchen never goes fully cold. Best-effort: a
-      # slow/failed ping never fails the push job.
-      - name: Keep AI orchestrator warm
-        if: always()
-        run: curl -m 25 -fsS https://cwf-ai-orchestrator.onrender.com/healthz -o /dev/null || true
+          # Events older than this are marked handled but NOT pushed. Without it,
+          # the first run after an outage (push was down 25-30 Aug) would fire a
+          # multi-day backlog of banners at everyone at once.
+          MAX_EVENT_AGE_HOURS: '12'
+          # Hard ceiling on how far back a stalled cursor may reach, so a long
+          # outage can never turn the incremental scan into a full-table scan and
+          # blow through Spark's 50k daily reads.
+          MAX_LOOKBACK_HOURS: '48'
+        run: |
+          # Wake the free Render dyno IN THE SAME JOB rather than from a separate
+          # keep-warm workflow — a standalone workflow costs a full billed minute
+          # to send one 8-second HTTP request (that pattern was burning 1,022
+          # min/month across the account). -m 5 is deliberate: Render starts the
+          # instance the moment the request reaches its router, so we do not need
+          # to wait for the response body, and we never risk the 60 s boundary.
+          curl -m 5 -fsS https://cwf-ai-orchestrator.onrender.com/healthz -o /dev/null || true
+          node scan.js

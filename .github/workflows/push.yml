@@ -36,30 +36,10 @@ name: CWF push (friends · messages · feed · clubs)
 #
 # Then delete the three tiered cron lines below and use the single '*/15' line.
 #
-# ── TIERED CRON (private-repo safe) ──────────────────────────────────────────
-# Because cost == NUMBER OF RUNS, not their length, the only lever on a private
-# repo is running less often when nobody is looking. Times below are Eastern
-# (UTC-4 in summer); the schedule is dense at dinner and sparse overnight:
-#
-#     18:00-22:59 ET   every 15 min    20 runs/day   ← when people cook & chat
-#     10:00-17:59 ET   every 30 min    16 runs/day
-#     23:00-09:59 ET   every 2 hours    6 runs/day
-#                                     ───────────
-#                                      42 runs/day ≈ 1,300 min/month
-#
-# ⚠️  THIS ALONE IS NOT ENOUGH — the 2,000 minutes are shared ACROSS THE WHOLE
-#     ACCOUNT, and with the other two scanners left at their current cadence the
-#     fleet still wants ~3,500 min/month:
-#
-#         cwf-push-scanner    42/day  ~1,300   (this file, after the fix)
-#         clawback-push-scanner 48/day ~1,490  (*/30 flat, untiered)
-#         tabby-trade-scanner ~32/wkdy  ~730   (*/15 on market hours)
-#                                     ────────
-#                                       ~3,520 / 2,000  → runs out ~day 17
-#
-#     Removing the two keep-warm workflows bought back ~1,022 min/month, which is
-#     what makes THIS repo viable, but the other two scanners still need tiering
-#     (or the public flip above) before the account stops hitting the wall.
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+# Every 15 min, all day. On a PRIVATE repo this was impossible: 96 runs/day is
+# ~2,880 billed min/month against a 2,000 allowance shared by every repo on the
+# account. Public repos have no such budget, so the tiering is gone.
 #
 # ── COST — Firebase (Spark) ──────────────────────────────────────────────────
 # The scanner is INCREMENTAL — each run only queries docs changed since that
@@ -67,11 +47,11 @@ name: CWF push (friends · messages · feed · clubs)
 # Well inside Spark's 50k reads / 20k writes per day.
 on:
   schedule:
-    - cron: '*/15 22-23,0-2 * * *'   # 18:00-22:59 ET — dinner/evening peak
-    - cron: '0,30 14-21 * * *'       # 10:00-17:59 ET — daytime
-    - cron: '0 3-13/2 * * *'         # 23:00-09:59 ET — overnight, every 2 h
-    # PUBLIC-REPO VERSION — delete the three lines above, uncomment this one:
-    # - cron: '*/15 * * * *'
+    # THIS REPO IS NOW PUBLIC (30 Aug 2026) — GitHub-hosted standard runners are
+    # free and UNLIMITED for public repos, so the minute budget no longer exists
+    # and the tiered private-repo schedule has been retired. Back to every 15 min,
+    # around the clock, which also keeps the Render dyno warm all day.
+    - cron: '*/15 * * * *'
   workflow_dispatch: {}              # "Run workflow" button for manual/test runs
 
 concurrency:

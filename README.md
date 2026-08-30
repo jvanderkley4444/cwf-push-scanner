@@ -91,9 +91,12 @@ scanner jobs that were already running, so they cost nothing.
 
 **What changed here**
 
-* **Tiered cron** — dense at dinner, sparse overnight: `*/15` 18:00-22:59 ET,
-  `*/30` 10:00-17:59 ET, every 2 h 23:00-09:59 ET. 42 runs/day =
-  ~**1,300 min/month**, down 56 % from ~2,976.
+* **This repo is now PUBLIC** (30 Aug 2026), so standard-runner minutes are free
+  and unlimited and the cron is back to `*/15` around the clock. The tiered
+  private-repo schedule that shipped earlier the same day has been retired.
+  Before flipping, the history was rewritten to purge a hard-coded owner email
+  (`test-push.js`, `test-push.yml`); a fresh clone now carries no credential and
+  no email in any commit.
 * **`node_modules` cached directly** (not just `~/.npm`) so a cache hit skips
   `npm` entirely — runtime is what tips a job over the 60-second boundary into a
   *second* billed minute. One August run took 348 s = 6 billed minutes.
@@ -120,7 +123,7 @@ Deleting the keep-warm crons bought back ~1,022 min/month, which is what makes
 treatment (or the flip below) before the account stops hitting the wall around
 day 17 of each month.
 
-**The permanent fix: make this repo public.** GitHub-hosted standard runners are
+**Done — this repo is public.** GitHub-hosted standard runners are
 **free and unlimited for public repos**, so the minute budget stops existing and
 the cron can go back to `*/15` (or tighter). Nothing here is secret — the
 service-account JSON lives in an Actions secret, which stays private on a public
